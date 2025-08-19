@@ -3,10 +3,10 @@ from dotenv import load_dotenv
 import os, json, asyncio, traceback
 from langchain.chat_models import init_chat_model
 from langchain.prompts import ChatPromptTemplate
-import os
 import signal
 import sys
 from elevenlabs.client import ElevenLabs
+from elevenlabs import play
 from elevenlabs.conversational_ai.conversation import Conversation
 from elevenlabs.conversational_ai.default_audio_interface import DefaultAudioInterface
 from websockets.exceptions import ConnectionClosedOK
@@ -14,8 +14,8 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain.tools import Tool
 import logging
-import traceback
 import threading
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,7 +29,6 @@ def get_tools_description(tools):
 def run_agent():
     elevenlabs_agent_id = os.getenv("ELEVENLABS_AGENT_ID")
     elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
-
     
     if not elevenlabs_agent_id or not elevenlabs_api_key:
         raise ValueError("ELEVENLABS_AGENT_ID or ELEVENLABS_API_KEY is not set in the .env file")
@@ -50,7 +49,6 @@ def run_agent():
     signal.signal(signal.SIGINT, signal_handler)
     
     def start_conversation():
-        # Store the latest user transcript
         latest_user_transcript = [None]
         response_completed = [False]
     
@@ -67,10 +65,9 @@ def run_agent():
                 user_input_received.set()
                 print("Valid transcript received, processing...")
                 
-
         conversation = Conversation(
-            elevenlabs,
-            elevenlabs_agent_id,
+            client=elevenlabs,
+            agent_id=elevenlabs_agent_id,
             requires_auth=bool(elevenlabs_api_key),
             audio_interface=DefaultAudioInterface(),
             callback_agent_response=process_agent_response,
@@ -86,17 +83,13 @@ def run_agent():
             conversation = start_conversation()
             conversation.start_session()
             
-            # Wait for user input instead of ending immediately
             print("Listening for user input...")
-            user_input_received.wait(timeout=60)  # Wait up to 60 seconds for input
+            user_input_received.wait(timeout=60)
             
             if latest_action[0]:
                 print(f"Received user input: {latest_action[0]}")
-                # Give some time for any final processing
-                import time
                 time.sleep(1)
             
-            # Now end the session after we have the input and processing is done
             conversation.end_session()
             conversation_id = conversation.wait_for_session_end()
             print(f"Conversation ID: {conversation_id}")
@@ -114,11 +107,27 @@ def run_agent():
     
     return latest_action[0] if latest_action[0] else "No user input received"
 
-
 async def ask_human_tool(question: str) -> str:
     print(f"Agent asks: {question}")
     response = run_agent()
     return response
+
+async def tell_human_tool(statement: str) -> str:
+    client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID")
+    if not voice_id:
+        raise ValueError("ELEVENLABS_VOICE_ID is not set in the .env file")
+
+    audio = client.text_to_speech.convert(
+        text=statement,
+        voice_id=voice_id,
+        model_id="eleven_multilingual_v2",
+        output_format="mp3_44100_128",
+    )
+    play(audio)
+
+    print(f"Agent said: {statement}")
+    return "Message delivered to user."
 
 async def create_agent(coral_tools, agent_tools, runtime):
     coral_tools_description = get_tools_description(coral_tools)
@@ -133,25 +142,28 @@ async def create_agent(coral_tools, agent_tools, runtime):
         user_answer_tool = "answer_question"
         print(agent_tools_description)
     else:
-        # For other runtimes (e.g., devmode), agent_tools is a list of Tool objects
         agent_tools_description = get_tools_description(agent_tools)
         combined_tools = coral_tools + agent_tools
         user_request_tool = "ask_human"
-        user_answer_tool = "ask_human"
+        user_answer_tool = "tell_human"
 
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
-            f"""You are an agent interacting with the tools from Coral Server and using your own `{user_request_tool}` and `{user_answer_tool}` tool to communicate with the user. **You MUST NEVER finish the chain**
+            f"""Your name is Coral, an agent which can interact with the tools and agents from Coral Server to fulfill requests of the user.
+
+            You are also using your own `{user_request_tool}` and `{user_answer_tool}` tool to communicate with the user.
+
+            **You MUST NEVER finish the chain**
 
             Follow these steps in order:
             1. Use `list_agents` to list all connected agents and get their descriptions.
-            2. Use tool `{user_request_tool}` to ask: "How can I assist you today?" and wait for the response.
-            3. Understand the user's intent and decide which agent(s) are needed based on their descriptions.
-            4. If the user requests Coral Server information (e.g., agent status, connection info), use your tools to retrieve and return the information directly to the user, then go back to Step 1.
-            5. If fulfilling the request requires multiple agents, then call
-            `create_thread ('threadName': , 'participantIds': [ID of all required agents, including yourself])` to create conversation thread.
-            6. Add both context7 and coding agent to the same thread(create_thread) using 'add_participant'.
+            2. Use tool `{user_answer_tool}` to tell user "Hello, I am Coral. How can I assist you?"
+            3. Use tool `{user_request_tool}` to listen to the user's request.
+            4. Understand the user's intent and decide which agent(s) are needed based on their descriptions.
+            5. If the user requests Coral Server information (e.g., agent status, connection info), use your tools to retrieve and return the information directly to the user, then go back to Step 1.
+            6. If fulfilling the request requires multiple agents, then call
+                `create_thread ('threadName': , 'participantIds': [ID of all required agents, including yourself])` to create conversation thread.
             7. For each selected agent:
             * **If the required agent is not in the thread, add it by calling `add_participant(threadId=..., 'participantIds': ID of the agent to add)`.**
             * Construct a clear instruction message for the agent.
@@ -160,8 +172,7 @@ async def create_agent(coral_tools, agent_tools, runtime):
             * Record and store the response for final presentation.
             8. After all required agents have responded, think about the content to ensure you have executed the instruction to the best of your ability and the tools. Make this your response as "answer".
             9. Always respond back to the user by calling `{user_answer_tool}` with the "answer" or error occurred even if you have no answer or error.
-            10. Always send user query to the context7 agent and whatever response you receive from the context7 agent, should be sent to the coding agent as well.
-            11. Repeat the process from Step 1.
+            10. Repeat the process from Step 1.
 
             **You MUST NEVER finish the chain**
             
@@ -194,7 +205,7 @@ async def main():
 
     coral_params = {
         "agentId": agentID,
-        "agentDescription": "An agent that can scrape websites and provide easy to parse markdown"
+        "agentDescription": "Coral agent that takes user input via voice and interacts with other agents to fulfill requests of the user."
     }
 
     query_string = urllib.parse.urlencode(coral_params)
@@ -219,7 +230,7 @@ async def main():
     logger.info(f"Coral tools count: {len(coral_tools)}")
     
     if runtime is not None:
-        required_tools = ["request-question", "answer-question"]
+        required_tools = ["request_question", "answer_question"]
         available_tools = [tool.name for tool in coral_tools]
 
         for tool_name in required_tools:
@@ -235,7 +246,13 @@ async def main():
                 name="ask_human",
                 func=None,
                 coroutine=ask_human_tool,
-                description="Ask the user a question and wait for a response."
+                description="Ask the user a question by speaking it and wait for their spoken response."
+            ),
+            Tool(
+                name="tell_human",
+                func=None,
+                coroutine=tell_human_tool,
+                description="Tell the user something by speaking it, such as the final answer or information."
             )
         ]
     
