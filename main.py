@@ -12,7 +12,7 @@ def load_environment():
     runtime = os.getenv("CORAL_ORCHESTRATION_RUNTIME", None)
     if runtime is None:
         load_dotenv()
-    return os.getenv("ELEVENLABS_AGENT_ID"), os.getenv("ELEVENLABS_API_KEY")
+    return os.getenv("CORAL_AGENT_ID"), os.getenv("ELEVENLABS_AGENT_ID"), os.getenv("ELEVENLABS_API_KEY")
 
 class ConversationManager:
     """Manages conversation state and callbacks, including the latest user transcript."""
@@ -21,20 +21,28 @@ class ConversationManager:
         self.coral_agent = CoralAgent()
 
     def call_coral_agent(self, parameter: str = None, *args, **kwargs):
-        """Function to call CoralAgent with the latest transcript."""
-        if self.latest_transcript:
+        """Async function to call CoralAgent with the latest transcript."""
+        if not hasattr(self, 'coral_agent') or not isinstance(self.coral_agent, CoralAgent):
+            return "Error: CoralAgent not properly initialized"
+        
+        if self.latest_transcript and self.latest_transcript.strip():
             coral_agent_input = self.latest_transcript.strip()
+            history_str = "\n".join(f"{i+1}. {q}" for i, q in enumerate(self.coral_agent.history)) if self.coral_agent.history else "None"
+            
             try:
                 result = asyncio.run(self.coral_agent.agent_executor.ainvoke({
                     "agent_scratchpad": [],
                     "input_query": coral_agent_input,
-                    "coral_tools_description": self.coral_agent.tools_description
+                    "coral_tools_description": self.coral_agent.tools_description,
+                    "history": history_str
                 }))
                 coral_agent_output = result.get("output", "No response from CoralAgent")
+                self.coral_agent.history.append(coral_agent_input)
             except Exception as e:
                 coral_agent_output = f"Error in CoralAgent: {str(e)}"
         else:
             coral_agent_output = "No transcript available"
+        
         return coral_agent_output
 
     def update_transcript(self, transcript):
@@ -48,19 +56,19 @@ def setup_client_tools(conversation_manager):
     client_tools.register("call_coral_agent", conversation_manager.call_coral_agent, is_async=False)
     return client_tools
 
-def initialize_conversation(agent_id, api_key, dynamic_vars, client_tools, conversation_manager):
+def initialize_conversation(elevenlabs_agent_id, elevenlabs_api_key, dynamic_vars, client_tools, conversation_manager):
     """Initialize the ElevenLabs conversation with dynamic variables and callbacks."""
-    elevenlabs = ElevenLabs(api_key=api_key)
-    
+    elevenlabs = ElevenLabs(api_key=elevenlabs_api_key)
+
     config = ConversationInitiationData(
         dynamic_variables=dynamic_vars
     )
     
     conversation = Conversation(
         elevenlabs,
-        agent_id,
+        elevenlabs_agent_id,
         config=config,
-        requires_auth=bool(api_key),
+        requires_auth=bool(elevenlabs_api_key),
         audio_interface=DefaultAudioInterface(),
         client_tools=client_tools,
         callback_agent_response=lambda response: print(f"Agent: {response}"),
@@ -77,11 +85,10 @@ def handle_interrupt(conversation):
 
 def main():
     """Main function to set up and start the conversation."""
-    # Load environment variables
-    agent_id, api_key = load_environment()
-    
-    if not agent_id or not api_key:
-        print("Error: ELEVENLABS_AGENT_ID and ELEVENLABS_API_KEY must be set.")
+    coral_agent_id, elevenlabs_agent_id, elevenlabs_api_key = load_environment()
+
+    if not coral_agent_id or not elevenlabs_agent_id or not elevenlabs_api_key:
+        print("Error: CORAL_AGENT_ID, ELEVENLABS_AGENT_ID, and ELEVENLABS_API_KEY must be set.")
         return
     
     # Create conversation manager to handle transcript and callbacks
@@ -92,12 +99,12 @@ def main():
     
     # Initialize dynamic variables
     dynamic_vars = {
-        "agent_name": "coral",
+        "agent_name": coral_agent_id,
     }
     
     # Initialize conversation
-    conversation = initialize_conversation(agent_id, api_key, dynamic_vars, client_tools, conversation_manager)
-    
+    conversation = initialize_conversation(elevenlabs_agent_id, elevenlabs_api_key, dynamic_vars, client_tools, conversation_manager)
+
     # Set up signal handler for termination
     handle_interrupt(conversation)
     
